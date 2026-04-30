@@ -446,7 +446,7 @@ static void clamp_mss(const node_t *source, const node_t *via, vpn_packet_t *pac
 			continue;
 		}
 
-		if(packet->data[start + 21] != 4) {
+		if(packet->data[start + 21 + i] != 4) {
 			break;
 		}
 
