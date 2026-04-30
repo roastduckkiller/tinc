@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Two-node tinc lab using Linux network namespaces.
-# This is local-only and reversible: sudo ./scripts/tinc_ns_lab.sh clean
+# Local-only and reversible: sudo ./scripts/tinc_ns_lab.sh clean
 
 ROOT=${ROOT:-/tmp/tinc-openwrt-hardened-lab}
 REPO=${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
@@ -16,12 +16,22 @@ VPN_A=10.91.0.1
 VPN_B=10.91.0.2
 PORT_A=6551
 PORT_B=6552
+UNDERLAY_MTU=${UNDERLAY_MTU:-1500}
+TINC_MTU=${TINC_MTU:-1380}
 
 need_root() {
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
     echo "Please run as root: sudo $0 $*" >&2
     exit 1
   fi
+}
+
+ns_exists() {
+  ip netns list | awk '{print $1}' | grep -qx "$1"
+}
+
+ensure_lab() {
+  ns_exists "$NS_A" && ns_exists "$NS_B" || { echo "Lab not running. Use: sudo $0 all" >&2; exit 1; }
 }
 
 clean() {
@@ -35,7 +45,7 @@ clean() {
 }
 
 write_node() {
-  local node=$1 underlay=$2 vpn=$3 port=$4 peer=$5 peer_underlay=$6 peer_vpn=$7 peer_port=$8
+  local node=$1 underlay=$2 vpn=$3 port=$4 peer=$5
   local dir="$ROOT/$node"
   mkdir -p "$dir/hosts" "$dir/log"
   openssl genrsa -out "$dir/rsa_key.priv" 2048 >/dev/null 2>&1
@@ -66,7 +76,7 @@ EOF
   cat >"$dir/tinc-up" <<EOF
 #!/bin/sh
 ip addr add $vpn/24 dev \$INTERFACE
-ip link set \$INTERFACE mtu 1380 up
+ip link set \$INTERFACE mtu $TINC_MTU up
 EOF
   chmod +x "$dir/tinc-up"
 
@@ -82,8 +92,8 @@ setup() {
   clean || true
   mkdir -p "$ROOT"
 
-  write_node a "$UNDERLAY_A" "$VPN_A" "$PORT_A" b "$UNDERLAY_B" "$VPN_B" "$PORT_B"
-  write_node b "$UNDERLAY_B" "$VPN_B" "$PORT_B" a "$UNDERLAY_A" "$VPN_A" "$PORT_A"
+  write_node a "$UNDERLAY_A" "$VPN_A" "$PORT_A" b
+  write_node b "$UNDERLAY_B" "$VPN_B" "$PORT_B" a
   cp "$ROOT/a/hosts/a" "$ROOT/b/hosts/a"
   cp "$ROOT/b/hosts/b" "$ROOT/a/hosts/b"
 
@@ -96,12 +106,13 @@ setup() {
   ip -n "$NS_B" addr add "$UNDERLAY_B/24" dev veth-b
   ip -n "$NS_A" link set lo up
   ip -n "$NS_B" link set lo up
-  ip -n "$NS_A" link set veth-a up mtu 1500
-  ip -n "$NS_B" link set veth-b up mtu 1500
+  ip -n "$NS_A" link set veth-a up mtu "$UNDERLAY_MTU"
+  ip -n "$NS_B" link set veth-b up mtu "$UNDERLAY_MTU"
 }
 
 start() {
   need_root start
+  ensure_lab
   [[ -x "$TINCD" ]] || { echo "Missing tincd: $TINCD" >&2; exit 1; }
   ip netns exec "$NS_A" "$TINCD" -n "$NET" -c "$ROOT/a" --logfile="$ROOT/a/log/tinc.log" --pidfile="$ROOT/a/tinc.pid" -d1
   ip netns exec "$NS_B" "$TINCD" -n "$NET" -c "$ROOT/b" --logfile="$ROOT/b/log/tinc.log" --pidfile="$ROOT/b/tinc.pid" -d1
@@ -114,27 +125,99 @@ stop() {
   [[ -f "$ROOT/b/tinc.pid" ]] && kill "$(cat "$ROOT/b/tinc.pid")" 2>/dev/null || true
 }
 
+status_lab() {
+  need_root status
+  ensure_lab
+  echo "== links =="
+  ip -n "$NS_A" -br addr
+  ip -n "$NS_B" -br addr
+  echo "== qdisc =="
+  ip netns exec "$NS_A" tc qdisc show dev veth-a
+  ip netns exec "$NS_B" tc qdisc show dev veth-b
+  echo "== tinc sockets =="
+  ip netns exec "$NS_A" ss -lntup 2>/dev/null | grep tinc || true
+  ip netns exec "$NS_B" ss -lntup 2>/dev/null | grep tinc || true
+}
+
 test_lab() {
   need_root test
+  ensure_lab
   echo "== underlay =="
   ip netns exec "$NS_A" ping -c 2 -W 1 "$UNDERLAY_B"
   echo "== vpn ping =="
   ip netns exec "$NS_A" ping -c 5 -W 1 "$VPN_B"
-  echo "== links =="
-  ip -n "$NS_A" -br addr
-  ip -n "$NS_B" -br addr
+  status_lab
   echo "== logs A =="
   tail -80 "$ROOT/a/log/tinc.log" || true
   echo "== logs B =="
   tail -80 "$ROOT/b/log/tinc.log" || true
 }
 
+netem() {
+  need_root netem
+  ensure_lab
+  local delay=${1:-40ms}
+  local loss=${2:-0%}
+  local rate=${3:-}
+  ip netns exec "$NS_A" tc qdisc replace dev veth-a root netem delay "$delay" loss "$loss"
+  ip netns exec "$NS_B" tc qdisc replace dev veth-b root netem delay "$delay" loss "$loss"
+  if [[ -n "$rate" ]]; then
+    ip netns exec "$NS_A" tc qdisc replace dev veth-a root handle 1: netem delay "$delay" loss "$loss"
+    ip netns exec "$NS_A" tc qdisc add dev veth-a parent 1: tbf rate "$rate" burst 32kbit latency 400ms
+    ip netns exec "$NS_B" tc qdisc replace dev veth-b root handle 1: netem delay "$delay" loss "$loss"
+    ip netns exec "$NS_B" tc qdisc add dev veth-b parent 1: tbf rate "$rate" burst 32kbit latency 400ms
+  fi
+  status_lab
+}
+
+reset_netem() {
+  need_root reset-netem
+  ensure_lab
+  ip netns exec "$NS_A" tc qdisc del dev veth-a root 2>/dev/null || true
+  ip netns exec "$NS_B" tc qdisc del dev veth-b root 2>/dev/null || true
+  status_lab
+}
+
+set_underlay_mtu() {
+  need_root mtu
+  ensure_lab
+  local mtu=${1:-1280}
+  ip -n "$NS_A" link set veth-a mtu "$mtu"
+  ip -n "$NS_B" link set veth-b mtu "$mtu"
+  status_lab
+}
+
+iperf_lab() {
+  need_root iperf
+  ensure_lab
+  local seconds=${1:-10}
+  local proto=${2:-tcp}
+  ip netns exec "$NS_B" pkill iperf3 2>/dev/null || true
+  ip netns exec "$NS_B" iperf3 -s -1 >"$ROOT/b/log/iperf3.log" 2>&1 &
+  local server_pid=$!
+  sleep 1
+  echo "== iperf3 $proto over tinc: $seconds sec =="
+  if [[ "$proto" == "udp" ]]; then
+    ip netns exec "$NS_A" iperf3 -c "$VPN_B" -u -b 20M -t "$seconds"
+  else
+    ip netns exec "$NS_A" iperf3 -c "$VPN_B" -t "$seconds"
+  fi
+  wait "$server_pid" 2>/dev/null || true
+  echo "== server log =="
+  cat "$ROOT/b/log/iperf3.log" || true
+}
+
 case "${1:-}" in
   setup) setup ;;
   start) start ;;
   stop) stop ;;
+  status) status_lab ;;
   test) test_lab ;;
+  iperf) shift; iperf_lab "$@" ;;
+  netem) shift; netem "$@" ;;
+  reset-netem) reset_netem ;;
+  mtu) shift; set_underlay_mtu "$@" ;;
   clean) clean ;;
   all) setup; start; test_lab ;;
-  *) echo "Usage: sudo $0 {setup|start|test|stop|clean|all}" >&2; exit 2 ;;
+  *) echo "Usage: sudo $0 {setup|start|test|status|iperf [sec] [tcp|udp]|netem [delay] [loss] [rate]|reset-netem|mtu [bytes]|stop|clean|all}" >&2; exit 2 ;;
 esac
