@@ -207,6 +207,47 @@ iperf_lab() {
   cat "$ROOT/b/log/iperf3.log" || true
 }
 
+mss_lab() {
+  need_root mss
+  ensure_lab
+  local expected=${1:-$((TINC_MTU - 40))}
+  local capture="$ROOT/b/log/mss-tcpdump.log"
+  local client="$ROOT/a/log/mss-iperf-client.log"
+  local server="$ROOT/b/log/mss-iperf-server.log"
+
+  ip netns exec "$NS_B" pkill iperf3 2>/dev/null || true
+  ip netns exec "$NS_B" iperf3 -s -1 >"$server" 2>&1 &
+  local server_pid=$!
+  sleep 1
+
+  ip netns exec "$NS_B" timeout 6 tcpdump -i tinc-b -nn -vvv -c 2 'tcp[tcpflags] & tcp-syn != 0' >"$capture" 2>&1 &
+  local capture_pid=$!
+  sleep 1
+
+  ip netns exec "$NS_A" iperf3 -c "$VPN_B" -t 1 >"$client" 2>&1 || true
+  wait "$capture_pid" 2>/dev/null || true
+  wait "$server_pid" 2>/dev/null || true
+
+  echo "== captured TCP SYN MSS over tinc =="
+  cat "$capture"
+
+  local mss
+  mss=$(grep -om1 'mss [0-9]*' "$capture" | awk '{print $2}')
+  if [[ -z "$mss" ]]; then
+    echo "FAIL: no MSS option captured" >&2
+    return 1
+  fi
+
+  echo "Observed MSS: $mss"
+  echo "Expected MSS <= $expected (TINC_MTU=$TINC_MTU minus IPv4/TCP headers)"
+  if (( mss <= expected )); then
+    echo "PASS: ClampMSS is active"
+  else
+    echo "FAIL: MSS is larger than expected" >&2
+    return 1
+  fi
+}
+
 case "${1:-}" in
   setup) setup ;;
   start) start ;;
@@ -214,10 +255,11 @@ case "${1:-}" in
   status) status_lab ;;
   test) test_lab ;;
   iperf) shift; iperf_lab "$@" ;;
+  mss) shift; mss_lab "$@" ;;
   netem) shift; netem "$@" ;;
   reset-netem) reset_netem ;;
   mtu) shift; set_underlay_mtu "$@" ;;
   clean) clean ;;
   all) setup; start; test_lab ;;
-  *) echo "Usage: sudo $0 {setup|start|test|status|iperf [sec] [tcp|udp]|netem [delay] [loss] [rate]|reset-netem|mtu [bytes]|stop|clean|all}" >&2; exit 2 ;;
+  *) echo "Usage: sudo $0 {setup|start|test|status|iperf [sec] [tcp|udp]|mss [expected]|netem [delay] [loss] [rate]|reset-netem|mtu [bytes]|stop|clean|all}" >&2; exit 2 ;;
 esac
